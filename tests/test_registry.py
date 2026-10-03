@@ -611,8 +611,14 @@ def test_gc_plan_survives_restart_and_executes_once(settings):
 
 # ---------------- GC 跨进程认领：同一 plan_id 只允许一个进程执行 ----------------
 
-def _gc_claim_worker(data_dir, plan_id, digest, mode, queue):
-    """子进程：独立 Registry + 独立 SQLite 连接，与父进程共享数据目录。"""
+def _gc_claim_worker(data_dir, plan_id, digest, mode, queue,
+                     ready_event, start_event, start_delay=0.0):
+    """子进程：独立 Registry + 独立 SQLite 连接，与父进程共享数据目录。
+
+    Registry 先构造完毕（启动恢复也要获取跨进程 EX 锁，因此不能在对方
+    执行 GC 时才构造，否则会在构造函数里阻塞到对方执行完毕），随后等待
+    父进程统一放行，再按各自延迟发起认领/执行。
+    """
     try:
         settings = Settings(data_dir=data_dir, upload_lease_seconds=3600,
                             gc_grace_seconds=3600)
@@ -628,6 +634,11 @@ def _gc_claim_worker(data_dir, plan_id, digest, mode, queue):
                 return orig_reachable(*a, **k)
 
             registry._reachable_sets = _slow_reachable
+
+        ready_event.set()
+        start_event.wait(10)
+        if start_delay:
+            time.sleep(start_delay)
 
         try:
             registry.gc_execute(plan_id)
@@ -661,16 +672,24 @@ def test_gc_same_plan_across_two_processes_only_one_deletes(settings):
 
     ctx = multiprocessing.get_context("fork")
     queue = ctx.Queue()
+    start_event = ctx.Event()
+    slow_ready = ctx.Event()
+    fast_ready = ctx.Event()
     slow = ctx.Process(target=_gc_claim_worker,
-                       args=(data_dir, plan_id, d, "slow", queue))
+                       args=(data_dir, plan_id, d, "slow", queue,
+                             slow_ready, start_event))
     fast = ctx.Process(target=_gc_claim_worker,
-                       args=(data_dir, plan_id, d, "fast", queue))
+                       args=(data_dir, plan_id, d, "fast", queue,
+                             fast_ready, start_event, 0.5))
     slow.start()
-    time.sleep(0.4)  # 等慢进程完成原子认领进入 executing
     fast.start()
+    # 两个子进程各自构造完 Registry（含 EX 启动恢复）后再统一放行；慢进程
+    # 立刻认领并在复核处挂起，快进程延迟 0.5s 发起竞争认领
+    assert slow_ready.wait(10) and fast_ready.wait(10), "workers failed to start"
+    start_event.set()
     results = []
     for p in (fast, slow):
-        p.join(timeout=15)
+        p.join(timeout=20)
         assert not p.is_alive(), f"{p.name} timed out"
         p.close()
     while not queue.empty():
@@ -827,6 +846,359 @@ def test_gc_plan_schema_migrates_from_two_state_layout(tmp_path):
     # 旧 pending 计划仍能被原子认领
     assert registry.db.claim_gc_plan("oldplan", 1.0, "h:1:x") == "claimed"
     assert registry.db.get_gc_plan("oldplan")["state"] == "executing"
+
+
+# ---------------- GC 与发布的跨进程竞态（flock 协调） ----------------
+
+def _gc_publish_gate_worker(data_dir, queue, plan_gate, recheck_gate,
+                            unlink_gate, mode, start_event, start_delay=0.0):
+    """子进程 GC：dry-run 后执行同一计划；在“认领后、复核前”与“文件删除后、
+    释放跨进程 EX 锁前”两个关键点与发布进程同步，以便确定性地复现交错。"""
+    try:
+        registry = Registry(Settings(
+            data_dir=data_dir, upload_lease_seconds=3600, gc_grace_seconds=3600))
+
+        orig_reachable = registry._reachable_sets
+        orig_delete = registry.storage.delete_blob
+
+        def _gated_reachable(*a, **k):
+            recheck_gate.set()
+            return orig_reachable(*a, **k)
+
+        def _gated_delete(digest):
+            result = orig_delete(digest)
+            unlink_gate.set()
+            time.sleep(1.0)  # 保持 EX 锁：此刻发布方应正阻塞在锁上
+            return result
+
+        registry._reachable_sets = _gated_reachable
+        registry.storage.delete_blob = _gated_delete
+
+        plan = registry.gc_dry_run(grace_seconds=0)
+        plan_gate.put(plan["plan_id"])
+
+        start_event.wait(10)
+        time.sleep(start_delay)
+        try:
+            rep = registry.gc_execute(plan["plan_id"])
+            queue.put({"mode": mode, "status": 200,
+                       "skipped": [b["digest"] for b in rep["skipped"]["blobs"]],
+                       "deleted": [b["digest"] for b in rep["deleted"]["blobs"]]})
+        except OCIError as exc:
+            queue.put({"mode": mode, "status": exc.status_code, "code": exc.code})
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        queue.put({"mode": mode, "fatal": f"{exc!r}\n{traceback.format_exc()}"})
+
+
+def _put_manifest_gate_worker(data_dir, queue, mode, manifest, tag, expected,
+                              start_event, start_delay=0.0):
+    """子进程发布：模拟另一进程 PUT /v2/{repo}/manifests/{tag}。"""
+    try:
+        registry = Registry(Settings(
+            data_dir=data_dir, upload_lease_seconds=3600, gc_grace_seconds=3600))
+        start_event.wait(10)
+        time.sleep(start_delay)
+        try:
+            digest = registry.put_manifest("app", tag, manifest, OCI_MANIFEST,
+                                           expected)
+            queue.put({"mode": mode, "status": 201, "digest": digest})
+        except OCIError as exc:
+            queue.put({"mode": mode, "status": exc.status_code, "code": exc.code})
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        queue.put({"mode": mode, "fatal": f"{exc!r}\n{traceback.format_exc()}"})
+
+
+def _drain(queue, n):
+    out = []
+    deadline = time.time() + 25
+    while len(out) < n and time.time() < deadline:
+        try:
+            out.append(queue.get(timeout=1))
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def test_cross_process_gc_deletes_first_publish_rejected_tag_unchanged(settings):
+    """GC 先删除：另一进程的发布引用校验必须看到 blob 已删 -> 400
+    MANIFEST_BLOB_UNKNOWN，标签不可见（未创建），旧标签若存在则保持不变。"""
+    data_dir = str(settings.data_dir)
+    c = TestClient(create_app(settings))
+    # 已有标签 old -> 引用一个仍然可达的 blob；候选 blob 无任何标签引用
+    live_cfg = push_blob(c, "app", b"live-cfg")
+    live_layer = push_blob(c, "app", b"live-layer")
+    old_manifest = make_manifest(b"live-cfg", [b"live-layer"])
+    push_manifest(c, "app", "old", old_manifest)
+    candidate = push_blob(c, "app", b"doomed candidate blob")
+    cfg = push_blob(c, "app", b"new-cfg")
+    with c.app.state.registry.lock:
+        c.app.state.registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        c.app.state.registry.db._conn.commit()
+
+    new_manifest = make_manifest(b"new-cfg", [b"doomed candidate blob"])
+    new_manifest_digest = digest_of(new_manifest)
+
+    ctx = multiprocessing.get_context("fork")
+    queue = ctx.Queue()
+    plan_gate = ctx.Queue(1)
+    recheck_gate, unlink_gate = ctx.Event(), ctx.Event()
+    gc_start, put_start = ctx.Event(), ctx.Event()
+    gc = ctx.Process(target=_gc_publish_gate_worker,
+                     args=(data_dir, queue, plan_gate, recheck_gate, unlink_gate,
+                           "gc", gc_start))
+    put = ctx.Process(target=_put_manifest_gate_worker,
+                      args=(data_dir, queue, "put", new_manifest, "new", None,
+                            put_start))
+    gc.start()
+    plan_id = plan_gate.get(timeout=10)
+    assert plan_id
+    put.start()
+    recheck_gate.wait(10)  # 等 GC 认领完成、进入持 EX 锁的复核窗口
+    gc_start.set()
+    put_start.set()
+    unlink_gate.wait(10)  # 等候选 blob 文件已被删除（EX 锁仍持有）
+
+    results = _drain(queue, 2)
+    for p in (put, gc):
+        p.join(timeout=20)
+        assert not p.is_alive()
+        p.close()
+    assert all("fatal" not in r for r in results), results
+    by_mode = {r["mode"]: r for r in results}
+    assert by_mode["gc"]["status"] == 200, by_mode
+    assert candidate in by_mode["gc"]["deleted"]
+    assert by_mode["put"]["status"] == 400, by_mode
+    assert by_mode["put"]["code"] == "MANIFEST_BLOB_UNKNOWN"
+
+    # 标签未创建：新标签不可见；旧标签原样指向、引用仍可拉取
+    assert c.get("/v2/app/tags/list").json()["tags"] == ["old"]
+    assert c.get("/v2/app/manifests/new").status_code == 404
+    assert c.get("/v2/app/manifests/old").content == old_manifest
+    assert c.get(f"/v2/app/blobs/{candidate}").status_code == 404
+    assert c.get(f"/v2/app/blobs/{live_layer}").status_code == 200
+    assert c.get(f"/v2/app/blobs/{live_cfg}").status_code == 200
+    # 发布失败的 manifest 也没有留下可见内容
+    assert c.get(f"/v2/app/manifests/{new_manifest_digest}").status_code == 404
+
+
+def test_cross_process_publish_commits_first_gc_skips_reachable_candidate(settings):
+    """发布先完成：标签提交先于 GC 复核，GC 必须重算出候选可达并跳过删除。"""
+    data_dir = str(settings.data_dir)
+    c = TestClient(create_app(settings))
+    candidate = push_blob(c, "app", b"rescued candidate blob")
+    cfg = push_blob(c, "app", b"cfg-rescue")
+    with c.app.state.registry.lock:
+        c.app.state.registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        c.app.state.registry.db._conn.commit()
+    manifest = make_manifest(b"cfg-rescue", [b"rescued candidate blob"])
+    manifest_digest = digest_of(manifest)
+
+    ctx = multiprocessing.get_context("fork")
+    queue = ctx.Queue()
+    plan_gate = ctx.Queue(1)
+    recheck_gate, unlink_gate = ctx.Event(), ctx.Event()
+    gc_start, put_start = ctx.Event(), ctx.Event()
+    gc = ctx.Process(target=_gc_publish_gate_worker,
+                     args=(data_dir, queue, plan_gate, recheck_gate, unlink_gate,
+                           "gc", gc_start, 1.5))
+    put = ctx.Process(target=_put_manifest_gate_worker,
+                      args=(data_dir, queue, "put", manifest, "v1", None,
+                            put_start, 0.0))
+    gc.start()
+    plan_id = plan_gate.get(timeout=10)
+    put.start()
+    # 先放行发布；GC 延迟 1.5s 才认领执行 -> 发布的校验→标签提交先完成
+    put_start.set()
+    put.join(timeout=20)
+    assert not put.is_alive()
+    put.close()
+    publish_result = _drain(queue, 1)[0]
+    assert "fatal" not in publish_result, publish_result
+    assert publish_result["status"] == 201, publish_result
+    # 发布已可见（标签可读、引用可拉取）
+    assert c.get("/v2/app/manifests/v1").content == manifest
+    assert c.get(f"/v2/app/blobs/{candidate}").status_code == 200
+
+    # 再放行 GC：认领后复核必须看到新标签，候选重新可达 -> 跳过
+    gc_start.set()
+    gc.join(timeout=20)
+    assert not gc.is_alive()
+    gc.close()
+    gc_result = _drain(queue, 1)[0]
+    assert "fatal" not in gc_result, gc_result
+    assert gc_result["status"] == 200, gc_result
+    assert candidate in gc_result["skipped"]
+    assert candidate not in gc_result["deleted"]
+
+    # GC 完成后标签未变，引用依然可拉取（标签未变时引用须可拉取）
+    assert c.get("/v2/app/manifests/v1").content == manifest
+    assert c.get(f"/v2/app/manifests/{manifest_digest}").content == manifest
+    assert c.get(f"/v2/app/blobs/{candidate}").status_code == 200
+    assert c.get(f"/v2/app/blobs/{cfg}").status_code == 200
+
+
+def test_gc_and_publish_race_in_process_no_dangling_tag(client):
+    """进程内复现报告的竞态：GC 认领后的复核-删除与并发 PUT 交错，
+    绝不允许出现“标签可读而 blob 404”。"""
+    registry = client.app.state.registry
+    cfg = push_blob(client, "app", b"cfg-race")
+    candidate = push_blob(client, "app", b"race candidate")
+    _age_all_blobs(registry)
+    manifest = make_manifest(b"cfg-race", [b"race candidate"])
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    # dry-run 先生成计划（不挂闸门）；闸门只挂在执行路径的复核上
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+
+    orig_reachable = registry._reachable_sets
+    gated = {"on": True}
+
+    def _gated_reachable(*a, **k):
+        if gated["on"]:
+            entered.set()
+            release.wait(5)
+            gated["on"] = False
+        return orig_reachable(*a, **k)
+
+    registry._reachable_sets = _gated_reachable
+
+    def run_gc():
+        return client.post("/gc", json={"dry_run": False,
+                                        "plan_id": plan["plan_id"]})
+
+    t = threading.Thread(target=run_gc)
+    t.start()
+    entered.wait(5)  # GC 已认领并在 EX 临界区内复核
+    # 此刻 PUT 必须阻塞在跨进程 EX（与进程内 RLock）锁外，无法先提交标签
+    put_done = threading.Event()
+    put_result = {}
+
+    def run_put():
+        put_result["r"] = client.put(
+            "/v2/app/manifests/v1", content=manifest,
+            headers={"Content-Type": OCI_MANIFEST})
+        put_done.set()
+
+    pt = threading.Thread(target=run_put)
+    pt.start()
+    assert not put_done.wait(0.5)  # 仍被 GC 临界区阻塞
+    release.set()                 # 放行 GC：先删候选
+    t.join(10)
+    pt.join(10)
+
+    put = put_result["r"]
+    # GC 先删除 -> 发布 400；标签不可见，且不存在悬空引用
+    if put.status_code == 400:
+        assert put.json()["errors"][0]["code"] == "MANIFEST_BLOB_UNKNOWN"
+        assert client.get("/v2/app/manifests/v1").status_code == 404
+        assert client.get(f"/v2/app/blobs/{candidate}").status_code == 404
+    else:  # 极端调度下发布先完成：标签与其引用必须都在
+        assert put.status_code == 201
+        assert client.get("/v2/app/manifests/v1").content == manifest
+        assert client.get(f"/v2/app/blobs/{candidate}").status_code == 200
+
+
+def test_cross_process_lock_exclusive_blocks_shared_open(settings):
+    """跨进程锁单测：EX 持有时另一实例的 SH（拉取开窗）必须等待；
+    句柄打开后 EX 删除文件也不影响已打开 fd 的流式读取。"""
+    client = TestClient(create_app(settings))
+    data = b"shared lock contents"
+    d = push_blob(client, "app", data)
+    holder = client.app.state.registry
+    opener = Registry(settings)  # 不同实例：不同 RLock，只靠 flock 互斥
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_exclusive():
+        with holder.xlock.exclusive():
+            entered.set()
+            release.wait(5)
+
+    t = threading.Thread(target=hold_exclusive)
+    t.start()
+    entered.wait(5)
+
+    opened = threading.Event()
+    got = {}
+
+    def shared_open():
+        # open_blob 的 SH 窗口覆盖“引用检查 → 打开句柄”
+        f, size = opener.open_blob("app", d)
+        got["f"], got["size"] = f, size
+        opened.set()
+
+    st = threading.Thread(target=shared_open)
+    st.start()
+    assert not opened.wait(0.5)  # EX 未释放，SH 开窗被阻塞
+    release.set()
+    t.join(5)
+    st.join(5)
+    assert opened.wait(5)
+    assert got["size"] == len(data)
+    # 句柄已打开后，即使 EX 删除文件，流式读取不受影响
+    with holder.xlock.exclusive():
+        holder.storage.delete_blob(d)
+    assert got["f"].read() == data
+    got["f"].close()
+
+
+def test_cross_process_gc_first_blocks_tag_move_old_refs_stay_pullable(settings):
+    """报告中的原始场景：标签已存在，另一进程试图把它移动到引用候选 blob 的
+    新 manifest；GC 先删除候选 -> PUT 400 MANIFEST_BLOB_UNKNOWN，标签未变，
+    且原标签指向的内容仍可拉取（标签未变时引用须可拉取）。"""
+    data_dir = str(settings.data_dir)
+    c = TestClient(create_app(settings))
+    old_cfg = push_blob(c, "app", b"old-cfg")
+    old_layer = push_blob(c, "app", b"old-layer")
+    old_manifest = make_manifest(b"old-cfg", [b"old-layer"])
+    push_manifest(c, "app", "release", old_manifest)
+    candidate = push_blob(c, "app", b"candidate for moved tag")
+    new_cfg = push_blob(c, "app", b"new-cfg-2")
+    with c.app.state.registry.lock:
+        c.app.state.registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        c.app.state.registry.db._conn.commit()
+    new_manifest = make_manifest(b"new-cfg-2", [b"candidate for moved tag"])
+
+    ctx = multiprocessing.get_context("fork")
+    queue = ctx.Queue()
+    plan_gate = ctx.Queue(1)
+    recheck_gate, unlink_gate = ctx.Event(), ctx.Event()
+    gc_start, put_start = ctx.Event(), ctx.Event()
+    gc = ctx.Process(target=_gc_publish_gate_worker,
+                     args=(data_dir, queue, plan_gate, recheck_gate, unlink_gate,
+                           "gc", gc_start))
+    put = ctx.Process(target=_put_manifest_gate_worker,
+                      args=(data_dir, queue, "put", new_manifest, "release",
+                            digest_of(old_manifest), put_start))
+    gc.start()
+    plan_gate.get(timeout=10)
+    put.start()
+    recheck_gate.wait(10)
+    gc_start.set()
+    put_start.set()
+    unlink_gate.wait(10)
+    results = _drain(queue, 2)
+    for p in (put, gc):
+        p.join(timeout=20)
+        assert not p.is_alive()
+        p.close()
+    assert all("fatal" not in r for r in results), results
+    by_mode = {r["mode"]: r for r in results}
+    assert by_mode["put"]["status"] == 400, by_mode
+    assert by_mode["put"]["code"] == "MANIFEST_BLOB_UNKNOWN"
+
+    # 标签未移动：仍指向旧 manifest，旧引用完好可拉取
+    assert c.get("/v2/app/manifests/release").content == old_manifest
+    assert c.get("/v2/app/manifests/release").headers[
+        "Docker-Content-Digest"] == digest_of(old_manifest)
+    assert c.get(f"/v2/app/blobs/{old_layer}").status_code == 200
+    assert c.get(f"/v2/app/blobs/{old_cfg}").status_code == 200
+    assert c.get(f"/v2/app/blobs/{candidate}").status_code == 404
 
 
 # ---------------- 重启恢复 ----------------

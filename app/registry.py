@@ -1,14 +1,25 @@
 """核心仓库逻辑：分块上传、manifest 发布（CAS）、垃圾回收。
 
-并发模型：进程内一把 threading.RLock 串行化所有元数据写事务与 GC；
-拉取 blob 时在锁内打开文件句柄，锁外流式发送——即使 GC 随后删除文件，
-POSIX 下已打开的 fd 依然可读，因此并发拉取不会被误删打断。
+并发模型（进程内 + 跨进程两层）：
 
-跨进程（多个进程挂载同一数据目录）时，进程内锁互不相见，因此 GC 执行
-不靠进程锁防重：gc_plans 表的 pending -> executing 原子认领在 SQLite
-写事务内完成并立即提交，跨进程只有一个赢家；认领失败者返回 409，不复核、
-不删除任何候选。认领成功后若异常或崩溃，计划永久停留在 executing，不可
-重放（再次提交同样 409），只能重新 dry-run。
+1. 进程内一把 threading.RLock 串行化同进程所有元数据写事务；拉取 blob 时
+   在锁内打开文件句柄，锁外流式发送——即使 GC 随后删除文件，POSIX 下已
+   打开的 fd 依然可读，因此并发拉取不会被误删打断。
+2. 多个进程挂载同一数据目录时进程内锁互不相见，因此另以数据目录中的
+   CrossProcessRWLock（fcntl.flock）做跨进程协调，所有路径一律
+   “先跨进程锁、再进程内 RLock”：
+   - EX：发布的引用校验→标签提交、GC dry-run 快照、GC 认领后的可达性
+     复核→元数据删除→文件删除→标记 executed、blob 提交/挂载、上传写、
+     启动恢复；
+   - SH：拉取的引用检查→打开 blob 文件句柄。
+   于是发布先完成时 GC 复核必见新标签（候选重新可达→跳过）；GC 先删除
+   时发布的引用校验必见 blob 已删（400 MANIFEST_BLOB_UNKNOWN，标签不可
+   见也不移动），不存在“标签可读而 blob 404”的交错。
+
+GC 执行防重不靠进程锁：gc_plans 表的 pending -> executing 原子认领在
+SQLite 写事务内完成并立即提交，跨进程只有一个赢家；认领失败者返回 409，
+不复核、不删除任何候选。认领成功后若异常或崩溃，计划永久停留在
+executing，不可重放（再次提交同样 409），只能重新 dry-run。
 """
 from __future__ import annotations
 
@@ -25,6 +36,7 @@ from . import errors as E
 from .config import Settings
 from .db import Database
 from .digest import is_digest, is_tag, sha256_bytes, sha256_file
+from .lock import CrossProcessRWLock
 from .storage import FileStorage
 
 DEFAULT_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
@@ -91,6 +103,8 @@ class Registry:
         self.storage = FileStorage(settings)
         self.db = Database(settings.db_path)
         self.lock = threading.RLock()
+        # 跨进程读写锁：发布/GC/拉取在共享数据目录上的仲裁点（见模块文档）
+        self.xlock = CrossProcessRWLock(settings.lock_path)
         # 跨进程认领计划时的认领者标识（仅写入 gc_plans.claimer 供诊断）
         self.instance_id = (
             f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
@@ -101,7 +115,8 @@ class Registry:
 
     def _reconcile(self):
         """重启后恢复：以上传临时文件为准修正会话进度；清理孤儿 blob 文件。"""
-        with self.lock:
+        # 与另一实例正在进行的发布/GC 互斥：EX 跨进程锁覆盖整个恢复过程
+        with self.xlock.exclusive(), self.lock:
             for u in self.db.list_uploads(state="active"):
                 path = self.storage.upload_path(u["id"])
                 if not path.exists():
@@ -118,7 +133,7 @@ class Registry:
     # ---------------- 上传会话 ----------------
 
     def start_upload(self, repo: str) -> dict:
-        with self.lock:
+        with self.xlock.exclusive(), self.lock:
             upload_id = uuid.uuid4().hex
             now = time.time()
             self.db.create_upload(
@@ -139,14 +154,14 @@ class Registry:
         return time.time() + self.settings.upload_lease_seconds
 
     def get_upload_status(self, repo: str, upload_id: str) -> dict:
-        with self.lock:
+        with self.xlock.exclusive(), self.lock:
             u = self._active_upload(repo, upload_id)
             self.db.update_upload_progress(u["id"], u["size"], self._renew_lease(u["id"]))
             return self.db.get_upload(upload_id)
 
     def append_chunk(self, repo: str, upload_id: str, chunk: bytes,
                      content_range: "str | None" = None) -> int:
-        with self.lock:
+        with self.xlock.exclusive(), self.lock:
             u = self._active_upload(repo, upload_id)
             path = self.storage.upload_path(upload_id)
             if not path.exists():
@@ -164,7 +179,7 @@ class Registry:
     def finalize_upload(self, repo: str, upload_id: str, digest: str,
                         chunk: "bytes | None" = None):
         """校验摘要并落库。已 committed 的会话允许同 digest 幂等重试。"""
-        with self.lock:
+        with self.xlock.exclusive(), self.lock:
             u = self.db.get_upload(upload_id)
             if u is None or u["repo"] != repo:
                 raise E.upload_unknown(upload_id)
@@ -202,7 +217,7 @@ class Registry:
         computed = sha256_bytes(payload)
         if computed != digest:
             raise E.digest_mismatch(expected=digest, computed=computed)
-        with self.lock:
+        with self.xlock.exclusive(), self.lock:
             tmp = self.storage.upload_path(uuid.uuid4().hex)
             with open(tmp, "wb") as f:
                 f.write(payload)
@@ -213,14 +228,14 @@ class Registry:
 
     def mount_blob(self, repo: str, digest: str) -> bool:
         """跨仓库挂载：blob 已存在则直接关联，实现秒级去重推送。"""
-        with self.lock:
+        with self.xlock.exclusive(), self.lock:
             if not self.db.blob_exists(digest) or not self.storage.has_blob(digest):
                 return False
             self.db.link_repo_blob(repo, digest)
             return True
 
     def cancel_upload(self, repo: str, upload_id: str):
-        with self.lock:
+        with self.xlock.exclusive(), self.lock:
             u = self.db.get_upload(upload_id)
             if u is None or u["repo"] != repo:
                 raise E.upload_unknown(upload_id)
@@ -230,8 +245,13 @@ class Registry:
     # ---------------- blob 读取 ----------------
 
     def open_blob(self, repo: str, digest: str):
-        """返回 (file, size)。文件句柄在锁内打开，GC 之后删文件不影响读取。"""
-        with self.lock:
+        """返回 (file, size)。
+
+        跨进程 SH 锁覆盖“命名空间引用检查 → 打开文件句柄”整个窗口：GC 的
+        EX 删除必须等待 SH 释放，因此返回的句柄一定在删除前打开；句柄打开
+        后立即释放两把锁并在锁外流式发送，POSIX 下随后 unlink 不影响读取。
+        """
+        with self.xlock.shared(), self.lock:
             if not self.db.repo_has_blob(repo, digest):
                 raise E.blob_unknown(repo, digest)
             try:
@@ -241,7 +261,7 @@ class Registry:
             return f, os.fstat(f.fileno()).st_size
 
     def stat_blob(self, repo: str, digest: str) -> int:
-        with self.lock:
+        with self.xlock.shared(), self.lock:
             f, size = self.open_blob(repo, digest)
             f.close()
             return size
@@ -272,7 +292,12 @@ class Registry:
             or DEFAULT_MANIFEST_MEDIA_TYPE
         )
 
-        with self.lock:
+        # 跨进程 EX 锁覆盖“引用校验 → manifest 入库 → 标签 CAS 提交”全程：
+        # 与 GC 认领后的“可达性复核 → 删除”临界区互斥。发布先提交标签则
+        # GC 复核必见该标签、候选重新可达而跳过；GC 先删除则这里的引用校验
+        # 必见缺失 blob/子 manifest，返回 400 MANIFEST_BLOB_UNKNOWN，标签
+        # 未创建/未移动，杜绝“标签可读而 blob 404”的悬空引用。
+        with self.xlock.exclusive(), self.lock:
             # 校验层引用：config/layers 必须是本 repo 已存在的 blob，
             # index 子 manifest / subject 必须已存在，杜绝悬空引用
             missing_blobs = [d for d in blob_refs if not self.db.repo_has_blob(repo, d)]
@@ -317,6 +342,12 @@ class Registry:
     # 绝不会被未审阅地删除；重新可达或续租的对象自动跳过。两个进程同时执行同一
     # 计划时，只有认领成功的一方删除，另一方 409 且不碰任何候选。认领后异常或
     # 崩溃，计划保持 executing（不可重放），剩余候选可重新 dry-run 审阅。
+    #
+    # 跨进程发布协调：认领（pending→executing）不持跨进程锁，但认领成功后的
+    # 「复核可达性 → 删元数据 → 删文件 → 标记 executed」整体在跨进程 EX 锁内，
+    # 与发布的「引用校验 → 标签提交」（同样 EX）在所有共享同一数据目录的进程间
+    # 互斥。发布先提交则复核必见新标签、候选重新可达而跳过；GC 先删除则发布
+    # 校验返回 MANIFEST_BLOB_UNKNOWN，标签不创建不移动，杜绝悬空引用。
 
     PLAN_TTL_SECONDS = 3600              # 计划生成后 1 小时内有效
     # executing 认领被视为“正在执行”的宽限：超过该时长仍未完成，认领失败方
@@ -383,7 +414,7 @@ class Registry:
             raise E.gc_invalid_request(
                 "grace_seconds must be >= 0", {"grace_seconds": grace}
             )
-        with self.lock:
+        with self.xlock.exclusive(), self.lock:
             now = time.time()
             cand = self._collect_candidates(now, grace)
             dead_blobs, dead_manifests = cand["dead_blobs"], cand["dead_manifests"]
@@ -518,9 +549,12 @@ class Registry:
                 stale=stale,
             )
 
-        # ---- 2. 认领成功：以下全部受进程锁保护；异常时计划留在 executing，
-        #         不回滚、不重放。 ----
-        with self.lock:
+        # ---- 2. 认领成功：以下全部处于跨进程 EX 锁内（再持进程内 RLock）。
+        #         与并发发布互斥：发布的引用校验→标签提交要么整体在本次复核
+        #         之前完成（新标签被重算的可达图看到、候选跳过），要么整体在
+        #         本次删除之后进行（引用校验看到 blob 已删、400 且标签不变）。
+        #         异常时计划留在 executing，不回滚、不重放。 ----
+        with self.xlock.exclusive(), self.lock:
             plan = self.db.get_gc_plan(plan_id)
             grace = plan["grace_seconds"]
             now = time.time()
@@ -579,10 +613,12 @@ class Registry:
                 else:
                     delete_uploads.append(u)
 
-            # ---- 实际删除（先元数据后文件），全程持锁与发布/拉取互斥 ----
+            # ---- 实际删除：一律先提交元数据、再删文件（崩溃残留为无元数据的
+            #      孤儿文件，由启动时 sweep 兜底；反过来则会留下指向不存在
+            #      文件的可见元数据）。全程持 EX 锁与发布/拉取互斥。 ----
             for u in delete_uploads:
-                self.storage.delete_upload_file(u["id"])
                 self.db.delete_upload(u["id"])
+                self.storage.delete_upload_file(u["id"])
             self.db.delete_manifests(
                 [(m["repo"], m["digest"]) for m in delete_manifests]
             )

@@ -34,6 +34,11 @@ class Settings:
         return self.data_dir / "registry.db"
 
     @property
+    def lock_path(self) -> Path:
+        # 跨进程读写锁（发布/GC/拉取协调）的锁文件，随数据目录共享
+        return self.data_dir / ".registry.lock"
+
+    @property
     def blobs_dir(self) -> Path:
         return self.data_dir / "blobs"
 
