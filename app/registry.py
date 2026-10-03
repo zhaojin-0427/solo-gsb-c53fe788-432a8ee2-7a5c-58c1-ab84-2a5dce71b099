@@ -1,14 +1,34 @@
 """核心仓库逻辑：分块上传、manifest 发布（CAS）、垃圾回收。
 
-并发模型：进程内一把 threading.RLock 串行化所有元数据写事务与 GC；
-拉取 blob 时在锁内打开文件句柄，锁外流式发送——即使 GC 随后删除文件，
-POSIX 下已打开的 fd 依然可读，因此并发拉取不会被误删打断。
+并发模型（两层协调）：
 
-跨进程（多个进程挂载同一数据目录）时，进程内锁互不相见，因此 GC 执行
-不靠进程锁防重：gc_plans 表的 pending -> executing 原子认领在 SQLite
-写事务内完成并立即提交，跨进程只有一个赢家；认领失败者返回 409，不复核、
-不删除任何候选。认领成功后若异常或崩溃，计划永久停留在 executing，不可
-重放（再次提交同样 409），只能重新 dry-run。
+1. 进程内一把 threading.RLock 串行化同一进程内的元数据写事务与 GC；拉取
+   blob 时在锁内打开文件句柄，锁外流式发送——即使 GC 随后删除文件，
+   POSIX 下已打开的 fd 依然可读，因此并发拉取不会被误删打断。
+2. 跨进程（多个进程挂载同一数据目录）时进程锁互不相见，由一把
+   CrossProcessLock（fcntl.flock 文件锁）串行化两类关键区间：
+
+   - 发布 manifest：从 config/layers/子 manifest 引用存在性校验、
+     manifest 落库到标签 CAS 提交，全程持排他锁；
+   - GC 执行：gc_plans 计划原子认领（pending -> executing）之后，
+     从可达性/租约复核、元数据删除到 blob 文件删除，全程持排他锁。
+
+   两区间因此跨进程严格串行，杜绝「发布引用校验已过、标签未提交，
+   GC 先删了 blob；随后标签可见但 blob 404」的悬空引用：
+
+   * 发布先完成 -> 标签已提交，GC 复核时 blob/候选 manifest 重新可达，
+     进入 skipped 而不是删除；
+   * GC 先完成 -> 引用的 blob 元数据与文件都已删除，发布校验失败，
+     PUT 返回 400 MANIFEST_BLOB_UNKNOWN 且标签未写入；既有标签未变，
+     其引用全部可拉取。
+
+   flock 随进程死亡由内核自动释放，不会形成僵死锁；dry-run 持共享锁
+   拍摄快照，多个 dry-run 可并行，但都不会看到发布进行到一半的状态。
+
+GC 执行本身还不靠进程锁防重：gc_plans 表的 pending -> executing 原子认领
+在 SQLite 写事务内完成并立即提交，跨进程只有一个赢家；认领失败者返回
+409，不复核、不删除任何候选。认领成功后若异常或崩溃，计划永久停留在
+executing，不可重放（再次提交同样 409），只能重新 dry-run。
 """
 from __future__ import annotations
 
@@ -23,6 +43,7 @@ from pathlib import Path
 
 from . import errors as E
 from .config import Settings
+from .coord import CrossProcessLock
 from .db import Database
 from .digest import is_digest, is_tag, sha256_bytes, sha256_file
 from .storage import FileStorage
@@ -91,6 +112,9 @@ class Registry:
         self.storage = FileStorage(settings)
         self.db = Database(settings.db_path)
         self.lock = threading.RLock()
+        # 跨进程协调：发布临界区（引用校验->标签提交）与 GC 临界区
+        # （复核->元数据/文件删除）在同一把 flock 上串行
+        self.xlock = CrossProcessLock(settings.lock_path)
         # 跨进程认领计划时的认领者标识（仅写入 gc_plans.claimer 供诊断）
         self.instance_id = (
             f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
@@ -272,7 +296,12 @@ class Registry:
             or DEFAULT_MANIFEST_MEDIA_TYPE
         )
 
-        with self.lock:
+        with self.lock, self.xlock.exclusive():
+            # 跨进程临界区：引用存在性校验 -> manifest 落库 -> 标签 CAS 提交
+            # 全程与 GC 的复核/删除串行。GC 先删掉候选 blob 时，这里的校验
+            # 立刻失败（400 MANIFEST_BLOB_UNKNOWN），manifest 与标签都不会
+            # 写入；本发布先提交标签时，GC 复核会发现候选重新可达而跳过。
+            #
             # 校验层引用：config/layers 必须是本 repo 已存在的 blob，
             # index 子 manifest / subject 必须已存在，杜绝悬空引用
             missing_blobs = [d for d in blob_refs if not self.db.repo_has_blob(repo, d)]
@@ -307,16 +336,21 @@ class Registry:
 
     # ---------------- 垃圾回收 ----------------
     #
-    # 两阶段复核：
-    #   dry-run  -> 快照候选清单并持久化为 plan（plan_id），只出报告不删除；
+    # 两阶段复核 + 跨进程串行：
+    #   dry-run  -> 持共享 flock 快照候选清单并持久化为 plan（plan_id），
+    #               只出报告不删除；
     #   execute  -> 必须携带 dry-run 返回的 plan_id；先在 SQLite 中把计划
-    #               从 pending 原子认领为 executing 并提交（跨进程互斥，只有
-    #               认领成功者继续），再在锁内重算可达性/租约，只删除
-    #               “计划内且仍符合条件”的对象，全部删完才标记 executed。
-    # 这样 dry-run 之后新产生的垃圾（如标签移动刚制造的不可达对象）不在计划内，
-    # 绝不会被未审阅地删除；重新可达或续租的对象自动跳过。两个进程同时执行同一
-    # 计划时，只有认领成功的一方删除，另一方 409 且不碰任何候选。认领后异常或
-    # 崩溃，计划保持 executing（不可重放），剩余候选可重新 dry-run 审阅。
+    #               从 pending 原子认领为 executing 并提交（跨进程防重，只有
+    #               认领成功者继续），再持排他 flock：重算可达性/租约，只删除
+    #               “计划内且仍符合条件”的对象（先元数据后文件），全部删完才
+    #               标记 executed。
+    # 排他 flock 与 manifest 发布临界区（引用校验->标签提交）互斥，因此：
+    # dry-run 之后新产生的垃圾（如标签移动刚制造的不可达对象）不在计划内，
+    # 绝不会被未审阅地删除；重新可达或续租的对象自动跳过；发布先提交标签时
+    # 候选重新可达被跳过，GC 先删完时发布的引用校验失败（400，标签不写入）。
+    # 两个进程同时执行同一计划时，只有认领成功的一方删除，另一方 409 且不碰
+    # 任何候选。认领后异常或崩溃，计划保持 executing（不可重放，flock 由内核
+    # 自动释放），剩余候选可重新 dry-run 审阅。
 
     PLAN_TTL_SECONDS = 3600              # 计划生成后 1 小时内有效
     # executing 认领被视为“正在执行”的宽限：超过该时长仍未完成，认领失败方
@@ -383,7 +417,7 @@ class Registry:
             raise E.gc_invalid_request(
                 "grace_seconds must be >= 0", {"grace_seconds": grace}
             )
-        with self.lock:
+        with self.lock, self.xlock.shared():
             now = time.time()
             cand = self._collect_candidates(now, grace)
             dead_blobs, dead_manifests = cand["dead_blobs"], cand["dead_manifests"]
@@ -464,13 +498,17 @@ class Registry:
         超过 1 小时（410）、已执行（409）。跨进程并发执行同一计划时，先在
         SQLite 中原子认领（pending -> executing，立即提交）：只有认领成功者
         继续复核与删除，竞争失败的一方收到 409 GC_PLAN_IN_PROGRESS，不复核、
-        不碰任何候选。认领成功后以计划记录的宽限期重算可达性与租约，只删除
-        计划内仍符合条件的对象；计划外的新候选、重新可达或续租的对象一律
-        跳过；全部删除完成后才把计划标记为 executed。
+        不碰任何候选。认领成功后在跨进程排他 flock 内以计划记录的宽限期重算
+        可达性与租约，只删除计划内仍符合条件的对象（先元数据后文件）；该
+        flock 与 manifest 发布临界区互斥——发布先提交标签则候选重新可达被
+        跳过，本区间先删完则发布的引用校验失败（400 MANIFEST_BLOB_UNKNOWN，
+        标签不写入）；计划外的新候选、重新可达或续租的对象一律跳过；全部
+        删除完成后才把计划标记为 executed。
 
         认领之后若抛异常或进程崩溃，计划保持 executing——这是不可重放的
         执行中状态：再次提交同一 plan_id 仍返回 409，已删部分不会重复执行，
-        剩余候选只能重新 dry-run 生成新计划审阅。
+        剩余候选只能重新 dry-run 生成新计划审阅；flock 由内核随进程死亡
+        自动释放。
         """
         if not plan_id or not isinstance(plan_id, str) or not plan_id.strip():
             raise E.gc_plan_required()
@@ -518,9 +556,15 @@ class Registry:
                 stale=stale,
             )
 
-        # ---- 2. 认领成功：以下全部受进程锁保护；异常时计划留在 executing，
-        #         不回滚、不重放。 ----
-        with self.lock:
+        # ---- 2. 认领成功：以下区间同时持有进程锁与跨进程排他 flock。
+        #         可达性复核 -> 元数据删除 -> blob 文件删除 -> 标记 executed
+        #         与任何并发发布（引用校验->标签提交）跨进程严格串行：
+        #         本区间内发布无法完成标签提交，因此复核时看不到的标签在
+        #         删除完成前不会出现；区间结束后才发布的请求会重新校验并
+        #         发现 blob 已不存在（400 MANIFEST_BLOB_UNKNOWN，标签不变）。
+        #         异常时计划留在 executing，不回滚、不重放；flock 由内核
+        #         在进程死亡时自动释放，不会僵死。 ----
+        with self.lock, self.xlock.exclusive():
             plan = self.db.get_gc_plan(plan_id)
             grace = plan["grace_seconds"]
             now = time.time()
@@ -579,7 +623,9 @@ class Registry:
                 else:
                     delete_uploads.append(u)
 
-            # ---- 实际删除（先元数据后文件），全程持锁与发布/拉取互斥 ----
+            # ---- 实际删除（先元数据后文件）：进程锁 + 跨进程 flock 与
+            #      并发发布互斥；拉取在打开文件句柄后流式发送，随后删文件
+            #      不影响进行中的下载 ----
             for u in delete_uploads:
                 self.storage.delete_upload_file(u["id"])
                 self.db.delete_upload(u["id"])

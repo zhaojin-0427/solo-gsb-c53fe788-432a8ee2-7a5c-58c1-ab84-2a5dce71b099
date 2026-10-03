@@ -15,7 +15,8 @@
 | 重启恢复 | 上传会话与进度持久化在 SQLite，重启后自动对齐磁盘实际进度，可继续续传 |
 | 不可变 manifest | digest 寻址的 manifest 内容与摘要不符即拒绝；发布时校验 config/layers/subject/子 manifest 引用必须已存在，杜绝悬空引用 |
 | 标签 CAS | 移动已存在的标签必须携带期望摘要（`If-Match` 头或 `?expected=`），不匹配返回 `409 TAG_CONFLICT` |
-| 安全 GC | 以「标签 + 未过期上传租约」为根建立可达图；**先 dry-run 生成持久化复核计划（`plan_id`，1 小时有效、重启有效），再凭 `plan_id` 执行**；执行前在 SQLite 中原子认领计划（`pending → executing`），多个进程共享同一数据目录并发执行同一计划时只有一个进程认领成功并删除，竞争方返回 `409 GC_PLAN_IN_PROGRESS` 且不碰候选；认领后进程崩溃则计划永久停留在 `executing`（不可重放），全部删除完成才标记 `executed`；执行时重算可达性/租约，只删计划内仍符合条件的对象，复核窗口内新产生的候选不会被误删；与并发拉取/发布互斥 |
+| 安全 GC | 以「标签 + 未过期上传租约」为根建立可达图；**先 dry-run 生成持久化复核计划（`plan_id`，1 小时有效、重启有效），再凭 `plan_id` 执行**；执行前在 SQLite 中原子认领计划（`pending → executing`），多个进程共享同一数据目录并发执行同一计划时只有一个进程认领成功并删除，竞争方返回 `409 GC_PLAN_IN_PROGRESS` 且不碰候选；认领后进程崩溃则计划永久停留在 `executing`（不可重放），全部删除完成才标记 `executed`；执行时重算可达性/租约，只删计划内仍符合条件的对象，复核窗口内新产生的候选不会被误删；与并发拉取互斥 |
+| 跨进程发布/GC 协调 | 进程内锁跨进程无效时，**manifest 发布（引用校验→标签提交）与 GC 执行（认领后可达性复核→元数据和文件删除）由一把 `flock` 文件锁跨进程串行**：发布先提交标签则 GC 跳过已重新可达的候选；GC 先删完则发布返回 `400 MANIFEST_BLOB_UNKNOWN` 且无可见标签。任何时刻「标签未变时其引用必可拉取」 |
 
 ## 快速开始（Docker Compose 一键启动）
 
@@ -30,6 +31,19 @@ docker compose up --build -d
 curl http://localhost:5000/v2/        # -> {} ，响应头含 Docker-Distribution-API-Version: registry/2.0
 curl http://localhost:5000/healthz    # -> {"status":"ok"}
 ```
+
+需要复现/验证**跨进程协调**时，可一键启动共享同一数据卷的第二个实例
+（默认不带 profile 时仍只启动单实例）：
+
+```bash
+docker compose --profile multiproc up --build -d
+# registry   -> http://localhost:5000
+# registry-b -> http://localhost:5001  （与 registry 共享同一个 registry-data 卷）
+```
+
+两个实例的数据元数据在同一 SQLite（WAL + `busy_timeout` 串行写），manifest
+发布与 GC 的关键区间由数据卷内的 `registry.lock`（`flock` 文件锁）互斥，
+详见下文「跨进程发布/GC 竞态与协调」。
 
 也可以本地直接运行（Python 3.11+）：
 
@@ -432,7 +446,13 @@ GC 语义：
   AND expires_at>?` 并立即提交。WAL + `busy_timeout` 保证跨进程写串行，因此
   两个进程同时执行同一计划时只有一个 `rowcount==1` 的赢家；输家收到
   409 `GC_PLAN_IN_PROGRESS`，不读取候选、不做删除。进程内 RLock 只负责同进程
-  内与发布/上传互斥，跨进程安全不依赖它。
+  内的串行；与并发发布的跨进程互斥见下一条与「跨进程发布/GC 竞态与协调」。
+- **跨进程发布互斥（防悬空标签）**：认领成功后的「可达性复核 → 元数据删除 →
+  blob 文件删除」全程持有数据目录内的 `registry.lock` 排他 `flock`，与
+  `PUT manifest` 的「引用校验 → manifest 落库 → 标签 CAS 提交」区间互斥。
+  发布先提交标签则复核时候选重新可达、进入 `skipped`；GC 先删完则发布的引用
+  校验失败（400 `MANIFEST_BLOB_UNKNOWN`），标签不写入。锁随进程死亡由内核
+  自动释放。
 - **认领即不可重放**：认领提交后若执行方异常或崩溃，计划永久停留在
   `executing`（`claimed_at`/`claimer` 记录认领时刻与 `host:pid` 实例）。重试
   同一 `plan_id` 一律 409，已删部分不会重复执行；剩余候选重新 dry-run 后用
@@ -447,23 +467,179 @@ GC 语义：
 - **回收对象**：不可达且超出宽限期的 blob、不可达（无标签）的 manifest、
   租约已过期的上传会话。
 - **保护机制**：未过期上传租约不会被清理；宽限期内的“新 blob”不会被清理
-  （覆盖“已推送 blob、尚未发布 manifest”的并发窗口）；GC 与发布/上传在同一
-  写锁下串行，拉取在打开文件句柄后再流式发送，文件随后被删也不影响进行中的下载。
+  （覆盖“已推送 blob、尚未发布 manifest”的并发窗口）；GC 执行的复核/删除区间与
+  manifest 发布的引用校验/标签提交区间由跨进程 `flock`（`registry.lock`）串行，
+  同进程内再由 `RLock` 串行，拉取在打开文件句柄后再流式发送，文件随后被删也不
+  影响进行中的下载。
 - 删除顺序为先清元数据再删文件，崩溃残留由下次启动时的孤儿文件清扫兜底。
+
+## 跨进程发布/GC 竞态与协调
+
+### 问题：进程内锁跨进程无效
+
+GC 与 HTTP 请求在同一进程内由一把 `RLock` 串行；但两个进程挂载同一数据
+目录时（同一卷上的两个容器、滚动升级新旧实例并存）进程锁互不可见，于是
+可能发生：
+
+1. 进程 A `POST /gc`（`dry_run:false` + `plan_id`）原子认领计划，**复核
+   可达性**：blob X 不可达、已过宽限期，是计划内候选；
+2. 进程 B `PUT /v2/demo/app/manifests/v1` 发布一个**引用 blob X** 的标签，
+   引用存在性校验通过（X 还在）；
+3. 进程 A 继续删除 X 的元数据与文件；进程 B 提交标签并返回 `201`。
+
+结果：标签可读（manifest 200），但拉取其引用的 blob 得到 `404`——悬空
+引用。
+
+### 协调：一把 flock 串行两个关键区间
+
+数据目录内新增 `registry.lock`（`app/coord.py`，`fcntl.flock` 咨询锁）：
+
+| 临界区 | 持锁 | 覆盖范围 |
+| --- | --- | --- |
+| `PUT manifests/<ref>` | 排他 EX | **引用存在性校验 → manifest 落库 → 标签 CAS 提交** |
+| `POST /gc` 执行（认领成功后） | 排他 EX | **可达性/租约复核 → 删元数据 → 删 blob 文件 → 标记 `executed`** |
+| `POST /gc` dry-run | 共享 SH | 候选快照（多个 dry-run 可并行，但看不到发布进行到一半的状态） |
+
+`gc_plans` 的 `pending → executing` 原子认领仍负责「同一计划只能执行一次」；
+`flock` 负责「发布与 GC 的判定/提交区间不交错」。两者叠加后只有两种交错
+顺序，且都安全：
+
+- **发布先完成**：标签已提交、引用先成为 GC 删除前的既成事实，GC 复核时
+  候选重新可达 → 进入 `skipped`，blob/manifest 都不删，标签与引用都可拉取；
+- **GC 先完成**：blob 的元数据与文件都已删除，发布随后拿到锁、重新做引用
+  校验 → `400 MANIFEST_BLOB_UNKNOWN`，manifest 与标签都不写入；既有标签
+  未变，其引用一律可拉取。
+
+`flock` 由内核对**进程**持有，进程异常退出或被 `SIGKILL` 时锁自动释放，
+不会留下僵死锁（区别于需要 TTL/续约的租约方案）。
+
+### 实际请求与响应（两种顺序）
+
+下面的响应在两个共享同一数据目录的真实实例（`:5000` / `:5001`）上实测。
+
+**顺序一：发布先完成 → GC 跳过已可达候选**
+
+```bash
+# dry-run：新 blob 此刻不可达，被列为计划内候选
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"dry_run": true, "grace_seconds": 0}' http://localhost:5000/gc   # plan_id=P1
+
+# 复核窗口内，另一请求先发布引用该 blob 的标签（201）
+curl -s -o /dev/null -w '%{http_code}\n' -X PUT \
+  -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' \
+  --data-binary @manifest.json \
+  http://localhost:5000/v2/race/demo/manifests/cap-pub-first
+# 201
+
+# 然后才执行 GC：复核发现候选已被标签引用 -> skipped，不删除
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"dry_run": false, "plan_id": "P1"}' http://localhost:5000/gc
+```
+
+```json
+{
+  "summary": {"blobs_deleted": 0, "manifests_deleted": 0, "uploads_deleted": 0,
+              "blobs_skipped": 1, "manifests_skipped": 0, "uploads_skipped": 0,
+              "bytes_reclaimed": 0},
+  "deleted": {"blobs": [], "manifests": [], "uploads": []},
+  "skipped": {
+    "blobs": [
+      {"digest": "sha256:3743d06b58c3d00e65d41cd2b2b3fd085734090d9666a67afc9b989f8bde153b",
+       "reason": "reachable again: referenced by a tagged manifest"}
+    ],
+    "manifests": [], "uploads": []
+  }
+}
+```
+
+标签与引用随后都可拉取：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://localhost:5000/v2/race/demo/manifests/cap-pub-first   # 200
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://localhost:5000/v2/race/demo/blobs/sha256:3743d06b... # 200
+```
+
+**顺序二：GC 先删除 → PUT 返回 400，且无可见标签**
+
+```bash
+# dry-run 生成计划（plan_id=P2，候选为 blob sha256:b2f4...）
+# 先执行 GC：候选仍不可达，元数据与文件都被删除
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"dry_run": false, "plan_id": "P2"}' http://localhost:5001/gc
+# deleted.blobs 含：
+# {"digest": "sha256:b2f4078147e44eb852792b0ab466ef2dd4c423bbcfa02a86a8871ee60504b101",
+#  "size": 22, "repos": ["race/demo"], "reason": "still unreferenced at execution"}
+
+# 之后（在真实并发里是「被锁挡住、GC 释放后才继续」的那次）发布引用它的标签
+curl -s -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' \
+  --data-binary @manifest.json \
+  http://localhost:5001/v2/race/demo/manifests/cap-gc-first
+```
+
+```http
+HTTP/1.1 400 Bad Request
+```
+
+```json
+{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN",
+  "message":"manifest references unknown content in repo 'race/demo': sha256:b2f4078147e44eb852792b0ab466ef2dd4c423bbcfa02a86a8871ee60504b101",
+  "detail":{"repo":"race/demo",
+            "missing":["sha256:b2f4078147e44eb852792b0ab466ef2dd4c423bbcfa02a86a8871ee60504b101"]}}]}
+```
+
+标签没有写入，两个实例上都不可见；既有标签未受影响：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://localhost:5000/v2/race/demo/manifests/cap-gc-first    # 404 MANIFEST_UNKNOWN
+curl -s http://localhost:5000/v2/race/demo/tags/list
+# {"name":"race/demo","tags":[... 不含 cap-gc-first ...]}
+```
+
+### 并发对抗实测（真实 HTTP，双进程）
+
+在两个独立进程上，每轮上传一个候选 blob、dry-run 出计划后，用三个线程
+**同时**发起：进程 A 执行 GC、进程 B 执行同一计划、进程 B `PUT` 引用该
+blob 的新标签；连续 40 轮，每轮从两个端口核对「有标签必有 blob、无标签
+必为 404、同一计划恰好一个 GC 赢家」：
+
+```text
+{
+  "tag_ok": 36,              # 发布先完成：201，候选进入 GC 的 skipped
+  "put_rejected": 4,         # GC 先删完：400 MANIFEST_BLOB_UNKNOWN，无标签
+  "gc_200": 40,              # 每轮恰好一个认领赢家执行成功
+  "gc_409": 40,              # 另一进程：GC_PLAN_IN_PROGRESS / ALREADY_EXECUTED
+  "candidate_deleted": 4
+}
+OK: 40 rounds, both orderings observed, no dangling tags
+```
+
+- 36 轮发布先提交标签：PUT `201`，GC 响应 `skipped.blobs` 中带
+  `"reachable again: referenced by a tagged manifest"`，blob 仍可拉取；
+- 4 轮 GC 先删完：PUT `400 MANIFEST_BLOB_UNKNOWN`，标签与 manifest 均为
+  `404`，两个端口上都没有悬空引用；
+- 80 次 GC 执行请求中恰好 40 个 `200`、40 个 `409`（认领互斥 + 不可重放
+
+保留不变）。
 
 ## 目录结构
 
 ```
 app/
   main.py       # FastAPI 路由（/v2/*、/gc 两阶段复核与跨进程原子认领）
-  registry.py   # 核心逻辑：上传、manifest CAS、GC 可达图与计划原子认领/复核执行
+  registry.py   # 核心逻辑：上传、manifest CAS、GC 可达图与计划原子认领/复核执行；
+                #   发布与 GC 的关键区间在进程锁外再持跨进程 flock
+  coord.py      # 跨进程协调：fcntl.flock 文件读写锁（registry.lock）
+                #   EX=发布/GC 执行，SH=dry-run；进程死亡由内核自动释放
   db.py         # SQLite 元数据（WAL + busy_timeout；gc_plans 支持 pending/executing/executed 三态原子认领）
   storage.py    # 本地文件存储：blobs/sha256/<hex> 内容寻址 + uploads/<uuid>
   digest.py     # digest/tag/repo 校验与 sha256 计算
   errors.py     # OCI 错误模型（含 GC_PLAN_*，认领失败为 GC_PLAN_IN_PROGRESS 409）
-  config.py     # 环境变量配置
-tests/test_registry.py   # 33 个端到端测试
-Dockerfile / docker-compose.yml
+  config.py     # 环境变量配置（含 registry.lock 路径）
+tests/test_registry.py   # 35 个端到端测试
+Dockerfile / docker-compose.yml（默认单实例；--profile multiproc 启动共享卷双实例）
 ```
 
 ## 本地开发与测试
@@ -477,19 +653,30 @@ pytest tests/ -q
 manifest 引用校验、digest 不可变性、标签 CAS 冲突、GC dry-run/执行、
 宽限期与租约保护、GC 与并发拉取/发布竞争、重启后恢复上传，以及 GC 复核计划：
 dry-run 后新增候选不被误删、重新可达/续租跳过、计划缺失/未知/过期(410)/已执行
-(409)拒绝、计划跨重启有效且只能执行一次；**新增：两个独立进程（各自的连接、锁
+(409)拒绝、计划跨重启有效且只能执行一次；两个独立进程（各自的连接、锁
 与 Registry 实例，fork 子进程）同时执行同一 `plan_id` 时恰好一个成功删除、竞争
 方 409 `GC_PLAN_IN_PROGRESS` 且不碰候选；认领后模拟崩溃，计划保留为不可重放的
 `executing`、重试 409、剩余候选可重新 dry-run 回收；长期未完成的僵死计划
-`stale:true` 提示；旧两态（pending/executed）数据库平滑迁移**。
+`stale:true` 提示；旧两态（pending/executed）数据库平滑迁移；**新增两个
+跨进程竞态测试（fork 独立进程共享数据目录，真实 SQLite/文件/flock，不经
+HTTP mock）：发布先提交标签时 GC 复核在锁后进行、候选重新可达被跳过且标签
+引用可拉取；GC 持锁先删完元数据与文件后发布才拿到锁、PUT 返回
+`400 MANIFEST_BLOB_UNKNOWN`、标签不可见（404）且既有标签引用仍可拉取**。
 
 ## 设计说明与限制
 
 - **共享数据目录与多进程**：SQLite 以 WAL 打开并设置 15s `busy_timeout`，
   多个进程可以挂载同一个数据目录（例如同一卷上的两个容器、滚动升级时的新旧
-  实例并存）。GC 执行通过 `gc_plans` 的原子状态认领跨进程互斥，同一计划只会
-  被一个进程执行；其它元数据写事务由 SQLite 自身的写锁串行化。compose 默认
-  仍以单实例运行；水平扩展到多节点仍需替换为外部数据库与共享存储。
+  实例并存）。两层协调保证一致性：`gc_plans` 的原子状态认领保证同一计划跨
+  进程只会被一个进程执行（竞争方 409，不碰候选）；数据目录内的
+  `registry.lock`（`fcntl.flock`）让 manifest 发布的「引用校验→标签提交」
+  与 GC 的「复核→元数据/文件删除」跨进程严格串行——发布先提交则 GC 跳过
+  已可达候选，GC 先删完则发布 400 且无可见标签，标签可见时其引用必可拉取。
+  `flock` 随进程死亡由内核自动释放，无需 TTL/续约，也不存在僵死锁；dry-run
+  持共享锁拍摄快照。compose 默认单实例运行，加 `--profile multiproc` 可一键
+  启动共享同一卷的两个实例（`:5000`/`:5001`）做并发验证；`flock` 要求各
+  实例与数据目录在同一台宿主机上，水平扩展到多节点仍需替换为外部数据库与
+  共享存储。
 - **命名空间隔离**：blob 物理上全局去重，但 `GET /v2/<repo>/blobs/<digest>`
   要求该 blob 已在 `<repo>` 命名空间内关联，跨仓库不可直接读。
 - **manifest 不可变**：同一 digest 的内容恒定；digest 寻址的 PUT 会校验内容

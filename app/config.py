@@ -40,3 +40,8 @@ class Settings:
     @property
     def uploads_dir(self) -> Path:
         return self.data_dir / "uploads"
+
+    @property
+    def lock_path(self) -> Path:
+        """跨进程 flock 文件：协调发布与 GC 的引用/删除临界区。"""
+        return self.data_dir / "registry.lock"

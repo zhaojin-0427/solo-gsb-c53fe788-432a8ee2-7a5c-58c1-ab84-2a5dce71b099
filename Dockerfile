@@ -14,5 +14,6 @@ ENV REGISTRY_DATA_DIR=/data \
 VOLUME /data
 EXPOSE 8000
 
-# 单进程运行：SQLite 单写者 + 进程内锁保证一致性
+# 可多进程共享同一数据目录：SQLite WAL 串行元数据写，flock 文件锁串行
+# manifest 发布与 GC 的跨进程临界区（见 app/coord.py）
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

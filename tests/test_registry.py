@@ -1,4 +1,5 @@
 """端到端测试：上传/续传/去重、manifest CAS、GC dry-run 与并发安全。"""
+import contextlib
 import hashlib
 import json
 import multiprocessing
@@ -827,6 +828,223 @@ def test_gc_plan_schema_migrates_from_two_state_layout(tmp_path):
     # 旧 pending 计划仍能被原子认领
     assert registry.db.claim_gc_plan("oldplan", 1.0, "h:1:x") == "claimed"
     assert registry.db.get_gc_plan("oldplan")["state"] == "executing"
+
+
+# ---------------- GC vs 发布：跨进程引用/删除竞态 ----------------
+
+def _layer_only_manifest(layer_digest: str, size: int) -> bytes:
+    """无 config、单 layer 的最小合法 image manifest。"""
+    return json.dumps({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "layers": [{"mediaType": OCI_LAYER, "digest": layer_digest, "size": size}],
+    }).encode()
+
+
+def _publish_worker(data_dir, repo, tag, manifest, started: "multiprocessing.Event",
+                    queue):
+    """独立进程：发起一次标签发布。started 在其进入跨进程排他临界区
+    （引用校验->标签提交）时置位，用于与 GC 进程确定性地排序。"""
+    try:
+        settings = Settings(data_dir=data_dir, upload_lease_seconds=3600,
+                            gc_grace_seconds=3600)
+        registry = Registry(settings)
+        _exclusive_orig = registry.xlock.exclusive
+
+        @contextlib.contextmanager
+        def _exclusive_signaled():
+            with _exclusive_orig():
+                started.set()
+                yield
+
+        registry.xlock.exclusive = _exclusive_signaled
+
+        try:
+            digest = registry.put_manifest(repo, tag, manifest, OCI_MANIFEST, None)
+            queue.put({"status": 201, "digest": digest})
+        except OCIError as exc:
+            queue.put({"status": exc.status_code, "code": exc.code,
+                       "detail": exc.detail})
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        queue.put({"fatal": f"{exc!r}\n{traceback.format_exc()}"})
+
+
+def _gc_worker_enter_event(data_dir, plan_id, entered: "multiprocessing.Event",
+                           digest, queue, hold_seconds: float = 0.0):
+    """独立进程：认领计划后，在进入 GC 跨进程排他临界区时置位 entered；
+    hold_seconds>0 时在临界区内停留，便于确定性地观察竞争方阻塞。"""
+    try:
+        settings = Settings(data_dir=data_dir, upload_lease_seconds=3600,
+                            gc_grace_seconds=3600)
+        registry = Registry(settings)
+        _exclusive_orig = registry.xlock.exclusive
+
+        @contextlib.contextmanager
+        def _exclusive_signaled():
+            with _exclusive_orig():
+                entered.set()
+                if hold_seconds:
+                    time.sleep(hold_seconds)
+                yield
+
+        registry.xlock.exclusive = _exclusive_signaled
+
+        try:
+            registry.gc_execute(plan_id)
+            queue.put({"status": 200,
+                       "blob_gone": registry.db.get_blob(digest) is None})
+        except OCIError as exc:
+            queue.put({"status": exc.status_code, "code": exc.code})
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        queue.put({"fatal": f"{exc!r}\n{traceback.format_exc()}"})
+
+
+def test_cross_process_publish_commits_before_gc_candidate_is_skipped(settings):
+    """发布先完成：标签在 GC 复核前提交，候选 blob/manifest 重新可达，
+    GC 跳过删除；标签可读且引用可拉取。"""
+    data_dir = str(settings.data_dir)
+    client = TestClient(create_app(settings))
+    repo, tag = "race", "v1"
+    layer = b"candidate published into a tag"
+    d = push_blob(client, repo, layer)
+    registry = client.app.state.registry
+    with registry.lock:  # 候选要老过宽限期，才会进计划
+        registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        registry.db._conn.commit()
+    manifest = _layer_only_manifest(d, len(layer))
+
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    assert d in {b["digest"] for b in plan["delete"]["blobs"]}
+    client.app.state.registry.db._conn.commit()  # 确保计划已落盘
+
+    ctx = multiprocessing.get_context("fork")
+    queue = ctx.Queue()
+    in_publish = ctx.Event()
+    gc_entered = ctx.Event()
+    publisher = ctx.Process(
+        target=_publish_worker,
+        args=(data_dir, repo, tag, manifest, in_publish, queue),
+    )
+    gc = ctx.Process(
+        target=_gc_worker_enter_event,
+        args=(data_dir, plan["plan_id"], gc_entered, d, queue),
+    )
+
+    publisher.start()
+    assert in_publish.wait(10), "publisher never entered its critical section"
+    # 此刻发布已持有排他 flock（标签即将/已经提交）；GC 必须在锁外等待，
+    # 等发布提交完成后才复核，因此看到候选重新可达而跳过
+    gc.start()
+    for p in (publisher, gc):
+        p.join(timeout=15)
+        assert not p.is_alive(), f"{p.name} timed out"
+        p.close()
+
+    results = []
+    while not queue.empty():
+        results.append(queue.get_nowait())
+    assert all("fatal" not in r for r in results), results
+
+    pub = next(r for r in results if "digest" in r)
+    gcr = next(r for r in results if "blob_gone" in r)
+    assert pub["status"] == 201, results
+    assert pub["digest"] == digest_of(manifest)
+    assert gcr["status"] == 200, results
+    assert gcr["blob_gone"] is False  # GC 跳过已可达候选，没有删 blob
+
+    # 用第三个独立进程复核对外可见状态：标签可读，blob 与 manifest 可拉取
+    verifier = TestClient(create_app(settings))
+    r = verifier.get(f"/v2/{repo}/manifests/{tag}")
+    assert r.status_code == 200
+    assert r.headers["Docker-Content-Digest"] == digest_of(manifest)
+    assert r.content == manifest
+    assert verifier.get(f"/v2/{repo}/blobs/{d}").status_code == 200
+    assert verifier.get(f"/v2/{repo}/blobs/{d}").content == layer
+    assert tag in verifier.get(f"/v2/{repo}/tags/list").json()["tags"]
+
+    # 该计划已执行完成，不可重放
+    assert verifier.post("/gc", json={"dry_run": False,
+                                     "plan_id": plan["plan_id"]}).status_code == 409
+
+
+def test_cross_process_gc_deletes_before_publish_put_rejected_no_tag(settings):
+    """GC 先完成：候选 blob 的元数据与文件都已删除后发布才拿到锁，引用
+    校验失败 -> 400 MANIFEST_BLOB_UNKNOWN，且没有任何可见标签；其它未变
+    标签的引用依然可拉取。"""
+    data_dir = str(settings.data_dir)
+    client = TestClient(create_app(settings))
+    repo, tag, other_tag = "race", "v1", "keep"
+    layer, keep_layer, keep_cfg = b"candidate deleted first", b"keep-layer", b"keep-cfg"
+    d = push_blob(client, repo, layer)
+    keep_manifest = _push_image(client, repo, other_tag, keep_cfg, [keep_layer])
+    registry = client.app.state.registry
+    with registry.lock:
+        registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        registry.db._conn.commit()
+    manifest = _layer_only_manifest(d, len(layer))
+
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    assert d in {b["digest"] for b in plan["delete"]["blobs"]}
+    client.app.state.registry.db._conn.commit()
+
+    ctx = multiprocessing.get_context("fork")
+    queue = ctx.Queue()
+    in_gc = ctx.Event()
+    publisher_ready = ctx.Event()
+    gc = ctx.Process(
+        target=_gc_worker_enter_event,
+        args=(data_dir, plan["plan_id"], in_gc, d, queue, 1.0),
+    )
+    publisher = ctx.Process(
+        target=_publish_worker,
+        args=(data_dir, repo, tag, manifest, publisher_ready, queue),
+    )
+
+    gc.start()
+    assert in_gc.wait(10), "GC never entered its critical section"
+    # GC 正在排他临界区内复核/删除。发布进程此刻启动并尝试 PUT：它会在
+    # flock 上阻塞，直到 GC 完成元数据与文件删除、释放锁后才进行引用校验
+    publisher.start()
+    assert publisher_ready.wait(10), "publisher never queued on the lock"
+    assert publisher.is_alive(), "publisher must be blocked while GC holds the lock"
+
+    for p in (gc, publisher):
+        p.join(timeout=15)
+        assert not p.is_alive(), f"{p.name} timed out"
+        p.close()
+
+    results = []
+    while not queue.empty():
+        results.append(queue.get_nowait())
+    assert all("fatal" not in r for r in results), results
+
+    gcr = next(r for r in results if "blob_gone" in r)
+    pub = next(r for r in results if "code" in r or r.get("status") == 201)
+    assert gcr["status"] == 200, results
+    assert gcr["blob_gone"] is True                # GC 先删除候选
+    assert pub["status"] == 400, results           # 发布被拒
+    assert pub["code"] == "MANIFEST_BLOB_UNKNOWN", results
+    assert d in pub["detail"]["missing"]
+
+    # 用第三个独立进程复核：新标签不可见；blob 元数据和文件都已消失
+    verifier = TestClient(create_app(settings))
+    tags = verifier.get(f"/v2/{repo}/tags/list").json()["tags"]
+    assert tag not in tags
+    assert other_tag in tags
+    r = verifier.get(f"/v2/{repo}/manifests/{tag}")
+    assert r.status_code == 404
+    assert r.json()["errors"][0]["code"] == "MANIFEST_UNKNOWN"
+    assert verifier.get(f"/v2/{repo}/blobs/{d}").status_code == 404
+    # blob 文件也已从共享存储删除（不只是元数据）
+    assert not (settings.blobs_dir / "sha256" / d.split(":")[1]).exists()
+
+    # 标签未变：既有标签的引用（config/layer/manifest）全部仍可拉取
+    r = verifier.get(f"/v2/{repo}/manifests/{other_tag}")
+    assert r.status_code == 200 and r.content == keep_manifest
+    assert verifier.get(f"/v2/{repo}/blobs/{digest_of(keep_layer)}").status_code == 200
+    assert verifier.get(f"/v2/{repo}/blobs/{digest_of(keep_cfg)}").status_code == 200
 
 
 # ---------------- 重启恢复 ----------------

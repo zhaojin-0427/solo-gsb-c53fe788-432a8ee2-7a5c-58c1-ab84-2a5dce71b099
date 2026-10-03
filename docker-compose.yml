@@ -18,5 +18,23 @@ services:
       retries: 3
     restart: unless-stopped
 
+  # 可选：第二个实例，与 registry 共享同一数据卷，用于演示/验证跨进程
+  # 协调（manifest 发布与 GC 的 flock 临界区、gc_plans 原子认领）。
+  # 默认 `docker compose up` 仍只启动单实例；需要双进程时：
+  #   docker compose --profile multiproc up --build
+  # 第二实例在宿主机映射到 5001，容器内仍监听 8000。
+  registry-b:
+    profiles: ["multiproc"]
+    build: .
+    image: local-oci-registry
+    ports:
+      - "5001:8000"
+    volumes:
+      - registry-data:/data
+    environment:
+      REGISTRY_UPLOAD_LEASE_SECONDS: "3600"
+      REGISTRY_GC_GRACE_SECONDS: "3600"
+    restart: unless-stopped
+
 volumes:
   registry-data:
